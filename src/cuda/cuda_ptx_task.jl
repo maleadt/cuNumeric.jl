@@ -140,6 +140,13 @@ function launch(kernel::CUDATask, inputs, outputs, scalars;
 end
 
 function ptx_task(ptx::String, kernel_name)
+    # Register PTX source synchronously in the C++ global store before
+    # submitting any Legate tasks. This ensures RunPTX* tasks on every GPU
+    # processor can lazy-compile the kernel even if LoadPTXTask hasn't run
+    # on that processor yet (no Legate data-dependency guarantees ordering
+    # between a no-store task and a store-bearing task).
+    cuNumeric.register_ptx_source(kernel_name, ptx)
+
     rt = Legate.get_runtime()
     lib = cuNumeric.get_lib() # grab lib of legate app
     # this taskid is directly tied to cpp code in our setup

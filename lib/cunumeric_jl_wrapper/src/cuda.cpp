@@ -21,6 +21,7 @@
 #include "cuda.h"
 
 #include <cstdint>
+#include <mutex>
 #include <regex>
 
 #include "legate.h"
@@ -107,6 +108,11 @@ using FunctionMap = std::unordered_map<FunctionKey, CUfunction, FunctionKeyHash,
 
 static legate::ProcLocalStorage<FunctionMap> cufunction_ptr{};
 
+// Global store: kernel_name → PTX source, written by LoadPTXTask,
+// read by any GPU processor's RunPTX* task for lazy compilation.
+static std::mutex ptx_store_mutex;
+static std::unordered_map<std::string, std::string> ptx_store;
+
 #ifdef CUDA_DEBUG
 std::string context_to_string(CUcontext ctx) {
   std::ostringstream oss;
@@ -184,6 +190,10 @@ struct PTXLaunchParams {
   std::uint32_t tx, ty, tz;
 };
 
+static void compile_ptx_into_map(FunctionMap &fmap, CUcontext ctx,
+                                 const std::string &kernel_name,
+                                 const std::string &ptx);
+
 // Reads common scalars (kernel_name, blocks, threads) and looks up the
 // compiled CUfunction. Shared by RunPTXTask and RunPTXBroadcastTask.
 static PTXLaunchParams read_launch_params(legate::TaskContext &context) {
@@ -203,9 +213,30 @@ static PTXLaunchParams read_launch_params(legate::TaskContext &context) {
   cuStreamGetCtx(p.stream, &ctx);
 
   FunctionKey key = {ctx, p.kernel_name};
-  assert(cufunction_ptr.has_value());
-  FunctionMap &fmap = cufunction_ptr.get();
+
+  // Get or lazily create the per-processor FunctionMap.
+  FunctionMap &fmap = [&]() -> FunctionMap & {
+    if (cufunction_ptr.has_value()) return cufunction_ptr.get();
+    cufunction_ptr.emplace(FunctionMap{});
+    return cufunction_ptr.get();
+  }();
+
   auto it = fmap.find(key);
+  if (it == fmap.end()) {
+    // This processor hasn't compiled the kernel yet. Fetch PTX from the
+    // global store (populated by LoadPTXTask on whichever proc ran first)
+    // and compile it here.
+    std::string ptx;
+    {
+      std::lock_guard<std::mutex> lock(ptx_store_mutex);
+      auto sit = ptx_store.find(p.kernel_name);
+      assert(sit != ptx_store.end() &&
+             "PTX not registered: ptx_task() must be called before launch()");
+      ptx = sit->second;
+    }
+    compile_ptx_into_map(fmap, ctx, p.kernel_name, ptx);
+    it = fmap.find(key);
+  }
 
 #ifdef CUDA_DEBUG
   if (it == fmap.end()) {
@@ -363,30 +394,15 @@ static inline void align8(char *&ptr) {
   launch_kernel(lp, arg_buffer, p - arg_buffer.data());
 }
 
-// https://github.com/nv-legate/legate.pandas/blob/branch-22.01/src/udf/load_ptx.cc
-/*static*/ void LoadPTXTask::gpu_variant(legate::TaskContext context) {
-  std::string ptx = context.scalar(0).value<std::string>();
-  std::string kernel_name = context.scalar(1).value<std::string>();
-
-  cudaStream_t stream_ = context.get_task_stream();
-  CUcontext ctx;
-  cuStreamGetCtx(stream_, &ctx);
-
+// Compile PTX and insert the resulting CUfunction into fmap for (ctx, name).
+// Called both from LoadPTXTask (on the task's own processor) and lazily from
+// read_launch_params on any processor that hasn't loaded the kernel yet.
+static void compile_ptx_into_map(FunctionMap &fmap, CUcontext ctx,
+                                 const std::string &kernel_name,
+                                 const std::string &ptx) {
   FunctionKey key = std::make_pair(ctx, kernel_name);
+  if (fmap.count(key)) return;
 
-  FunctionMap &fmap = [&]() -> FunctionMap & {
-    if (cufunction_ptr.has_value()) {
-      return cufunction_ptr.get();
-    } else {
-      cufunction_ptr.emplace(FunctionMap{});
-      return cufunction_ptr.get();
-    }
-  }();
-
-  auto it = fmap.find(key);
-  if (!(it == fmap.end())) {
-    return;
-  }  // we have this exact kernel already compiled.
 #ifdef CUDA_DEBUG
   std::cerr << ptx << std::endl;
 #endif
@@ -449,7 +465,38 @@ static inline void align8(char *&ptr) {
   fprintf(stderr, "placed function :%p\n", hfunc);
 #endif
 }
+
+// https://github.com/nv-legate/legate.pandas/blob/branch-22.01/src/udf/load_ptx.cc
+/*static*/ void LoadPTXTask::gpu_variant(legate::TaskContext context) {
+  std::string ptx = context.scalar(0).value<std::string>();
+  std::string kernel_name = context.scalar(1).value<std::string>();
+
+  cudaStream_t stream_ = context.get_task_stream();
+  CUcontext ctx;
+  cuStreamGetCtx(stream_, &ctx);
+
+  FunctionMap &fmap = [&]() -> FunctionMap & {
+    if (cufunction_ptr.has_value()) {
+      return cufunction_ptr.get();
+    } else {
+      cufunction_ptr.emplace(FunctionMap{});
+      return cufunction_ptr.get();
+    }
+  }();
+
+  compile_ptx_into_map(fmap, ctx, kernel_name, ptx);
+}
 }  // namespace ufi
+
+// Called from the Julia main thread (via ptx_task()) before any Legate tasks
+// are submitted. Writing here — synchronously, before task submission — ensures
+// the PTX source is visible to RunPTX* tasks on every GPU processor without
+// any data-dependency ordering from Legate.
+void register_ptx_source(const std::string &kernel_name,
+                         const std::string &ptx) {
+  std::lock_guard<std::mutex> lock(ufi::ptx_store_mutex);
+  ufi::ptx_store.emplace(kernel_name, ptx);
+}
 
 inline void add_xyz_scalars(legate::AutoTask &task,
                             const std::vector<uint32_t> &v) {
@@ -494,6 +541,7 @@ void wrap_cuda_methods(jlcxx::Module &mod) {
   mod.method("add_xyz_scalars", &add_xyz_scalars);
   mod.method("add_scalar_from_ptr", &add_scalar_from_ptr);
   mod.method("register_kernel_state_size", &register_kernel_state_size);
+  mod.method("register_ptx_source", &register_ptx_source);
   mod.method("gpu_sync", &gpu_sync);
   mod.method("extract_kernel_name", &extract_kernel_name);
   mod.set_const("LOAD_PTX", legate::LocalTaskID{ufi::TaskIDs::LOAD_PTX_TASK});
