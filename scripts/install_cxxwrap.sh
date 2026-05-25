@@ -43,45 +43,27 @@ fi
 
 echo "Using $JULIA at: $JULIA_PATH"
 
-GIT_REPO="https://github.com/JuliaInterop/libcxxwrap-julia.git"
-COMMIT_HASH="89e4699837bfa0929610c9e330889fb2df925b47" #(v14.2)
-JULIA_CXXWRAP_SRC=$CUNUMERIC_ROOT_DIR/lib/libcxxwrap-julia
-
-if [ ! -d "$JULIA_CXXWRAP_SRC" ]; then
-    cd $CUNUMERIC_ROOT_DIR/lib
-    git clone $GIT_REPO
-fi
-
-cd $JULIA_CXXWRAP_SRC
-git fetch --tags
-git checkout $COMMIT_HASH
-
 # find julia dependency path
 JULIA_DEP_PATH=$($JULIA -e 'println(DEPOT_PATH[1])')
 
-# https://github.com/JuliaInterop/libcxxwrap-julia/tree/v0.13.3?tab=readme-ov-file#configuring-and-building
 JULIA_CXXWRAP_DEV=$JULIA_DEP_PATH/dev/libcxxwrap_julia_jll
 JULIA_CXXWRAP=$JULIA_CXXWRAP_DEV/override
 
-# Clean up whatever env is there right now and
-# build default version of CxxWrap / libcxxwrap_julia
+# Remove existing dev/override to ensure a clean slate.
 #* THIS COULD BREAK SOME USERS CODE IF THEY ALREADY OVERRIDE THIS PKG
 cd $CUNUMERIC_ROOT_DIR
 [ -f Manifest.toml ] && rm Manifest.toml
 rm -rf $JULIA_CXXWRAP_DEV
+
 julia -e 'using Pkg; Pkg.activate("."); Pkg.add("Legate")'
 julia -e 'using Pkg; Pkg.activate("."); Pkg.precompile(["CxxWrap"])'
 
-# https://github.com/JuliaInterop/libcxxwrap-julia/tree/v0.13.3?tab=readme-ov-file#preparing-the-install-location
-# this command will download https://github.com/JuliaBinaryWrappers/libcxxwrap_julia_jll.jl and install it in JULIA_DEP_PATH
-julia -e 'using Pkg; Pkg.activate("."); Pkg.develop(PackageSpec(name="libcxxwrap_julia_jll")); import libcxxwrap_julia_jll; libcxxwrap_julia_jll.dev_jll()'
+# Develop libcxxwrap_julia_jll (creates dev dir without override/).
+julia -e 'using Pkg; Pkg.activate("."); Pkg.develop(PackageSpec(name="libcxxwrap_julia_jll"))'
 
+# dev_jll() sees no override/ dir → copies JLL artifact content to override/
+# This provides: lib/*.so, lib/cmake/JlCxx/*.cmake, include/jlcxx/*.hpp
+# find_package(JlCxx) in the wrapper CMakeLists.txt then resolves via JlCxx_DIR=override/lib/cmake/JlCxx
+julia -e 'using Pkg; Pkg.activate("."); import libcxxwrap_julia_jll; libcxxwrap_julia_jll.dev_jll()'
 
-# JULIA_CXXWRAP_OVERRIDE=$JULIA_CXXWRAP/override/
-# Delete the default JLL installation of cxxwrap_julia
-rm -rf $JULIA_CXXWRAP
-mkdir $JULIA_CXXWRAP
-
-cmake -S $JULIA_CXXWRAP_SRC -B $JULIA_CXXWRAP -DJulia_EXECUTABLE=$JULIA_PATH -DCMAKE_BUILD_TYPE=Release
-cd $JULIA_CXXWRAP
-make -j 16
+echo "libcxxwrap_julia_jll dev override populated from JLL artifact at $JULIA_CXXWRAP"
